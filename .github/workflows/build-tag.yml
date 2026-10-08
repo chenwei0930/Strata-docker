@@ -1,11 +1,16 @@
-name: Build Docker Image from Existing Tag
+name: Build Docker Image from Upstream Tag
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要编译的 Git tag，例如 v1.2.3"
+        description: "要编译的上游 Git tag，例如 v1.2.3"
         required: true
+        type: string
+      source_repo:
+        description: "上游仓库 owner/repo（留空使用默认值）"
+        required: false
+        default: "Niko1221/Strata"   # 改成你的上游仓库
         type: string
 
 permissions:
@@ -26,29 +31,37 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout the specified Git tag
-        uses: actions/checkout@v7
+      # 关键：checkout 上游仓库的指定 tag，而不是自己仓库
+      - name: Checkout upstream repo at tag
+        uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.source_repo }}
           ref: ${{ inputs.tag }}
+          # 如果上游是私有仓库，需要传 PAT；公开仓库可删掉这行
+          # token: ${{ secrets.UPSTREAM_TOKEN }}
 
       - name: Set image name
         id: image
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+        run: |
+          # 注意：这里用的是你自己的仓库名 -> ghcr.io/<your-user>/<your-repo>
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ steps.image.outputs.name }}:${{ inputs.tag }}
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ inputs.tag }}
+            ${{ steps.image.outputs.name }}:latest
