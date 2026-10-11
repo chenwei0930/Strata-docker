@@ -1,4 +1,4 @@
-name: Build Docker Image from Upstream Tag
+name: Build Docker Image from Upstream Tag (AVX2 Portable)
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ on:
         required: true
         type: string
       source_repo:
-        description: "上游仓库 owner/repo（留空使用默认值）"
+        description: "上游仓库 owner/repo"
         required: false
-        default: "Niko1221/Strata"   # 改成你的上游仓库
+        default: "Niko1221/Strata"
         type: string
 
 permissions:
@@ -20,31 +20,123 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
-      - name: Validate tag
+      - name: Validate inputs
+        id: validate
+        shell: bash
         env:
           TAG: ${{ inputs.tag }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
         run: |
-          if [[ ! "$TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
-            echo "无效的 Docker 镜像 tag：$TAG"
+          set -euo pipefail
+
+          # Docker tag 允许的字符；并给 "-avx2-portable" 后缀预留长度。
+          if [[ ! "$TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,113}$ ]]; then
+            echo "无效的上游 Git tag，或长度超过可用范围：$TAG"
             exit 1
           fi
 
-      # 关键：checkout 上游仓库的指定 tag，而不是自己仓库
+          if [[ ! "$SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "无效的上游仓库格式，应为 owner/repo：$SOURCE_REPO"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "source_repo=$SOURCE_REPO" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${TAG}-avx2-portable" >> "$GITHUB_OUTPUT"
+
+      # 从上游仓库 checkout 指定 tag，不是从本 workflow 所在仓库 checkout。
       - name: Checkout upstream repo at tag
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.source_repo }}
-          ref: ${{ inputs.tag }}
-          # 如果上游是私有仓库，需要传 PAT；公开仓库可删掉这行
+          repository: ${{ steps.validate.outputs.source_repo }}
+          ref: ${{ steps.validate.outputs.tag }}
+          persist-credentials: false
+          # 如果上游仓库是私有仓库，取消注释并配置 UPSTREAM_TOKEN：
           # token: ${{ secrets.UPSTREAM_TOKEN }}
+
+      # 修改 Actions 工作区内的 Dockerfile，不会修改上游仓库。
+      - name: Enable AVX2 portable engine build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          dockerfile = Path("Dockerfile")
+          if not dockerfile.is_file():
+              sys.exit("找不到上游 Dockerfile")
+
+          text = dockerfile.read_text()
+
+          # 先确认这个 tag 的源码声明了 portable 编译选项。
+          cmake_file = Path("CMakeLists.txt")
+          if not cmake_file.is_file():
+              sys.exit("找不到根目录 CMakeLists.txt，无法验证 STRATA_PORTABLE 选项")
+
+          cmake_text = cmake_file.read_text()
+          if "STRATA_PORTABLE" not in cmake_text:
+              sys.exit(
+                  "这个 tag 的 CMakeLists.txt 没有 STRATA_PORTABLE 选项；"
+                  "为避免生成未做 portable 编译的镜像，停止构建。"
+              )
+
+          # 定位 Dockerfile 中名为 strata 的引擎构建参数列表。
+          # 只修改引擎，不修改可选的 vision 构建。
+          pattern = re.compile(
+              r'(?s)'
+              r'(setup\.cmake_build\(\s*'
+              r'setup\.ROOT\s*,\s*'
+              r'setup\.ROOT\s*/\s*"build"\s*,\s*'
+              r'"strata"\s*,\s*'
+              r'\[)'
+              r'(.*?)'
+              r'(\]\s*,\s*None\s*,\s*"build-strata\.bat"\s*\))'
+          )
+
+          matches = list(pattern.finditer(text))
+          if len(matches) != 1:
+              sys.exit(
+                  "无法唯一识别 Dockerfile 中 strata 引擎的 CMake 构建参数。"
+                  "这个 tag 的 Dockerfile 结构可能已变化；请检查后更新补丁，"
+                  "不要直接构建未打补丁的镜像。"
+              )
+
+          match = matches[0]
+          args = match.group(2)
+
+          if "STRATA_PORTABLE" in args:
+              print("Dockerfile 已包含 STRATA_PORTABLE，跳过重复修改。")
+          else:
+              new_args = '\n"-DSTRATA_PORTABLE=ON",' + args
+              text = text[:match.start(2)] + new_args + text[match.end(2):]
+              dockerfile.write_text(text)
+              print("已向 strata 引擎构建参数加入 -DSTRATA_PORTABLE=ON")
+
+          # 最终再验证 Dockerfile 中引擎构建段确实包含该选项。
+          updated = dockerfile.read_text()
+          updated_match = pattern.search(updated)
+          if not updated_match or "STRATA_PORTABLE=ON" not in updated_match.group(2):
+              sys.exit("验证失败：引擎构建段中没有 STRATA_PORTABLE=ON")
+
+          print("Portable 构建参数验证通过。")
+          PY
+
+          grep -n -A8 -B2 'STRATA_PORTABLE=ON' Dockerfile
 
       - name: Set image name
         id: image
+        shell: bash
         run: |
-          # 注意：这里用的是你自己的仓库名 -> ghcr.io/<your-user>/<your-repo>
-          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "name=$image_name" >> "$GITHUB_OUTPUT"
+          echo "镜像名称：$image_name"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -61,7 +153,10 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          platforms: linux/amd64
           push: true
           tags: |
-            ${{ steps.image.outputs.name }}:${{ inputs.tag }}
-            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:${{ steps.validate.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
